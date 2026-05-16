@@ -8,12 +8,14 @@ import numpy as np
 from pathlib import Path
 from speechbrain.pretrained import SpeakerRecognition
 
-MODEL_SOURCE = "speechbrain/spkrec-ecapa-voxceleb"
-SAMPLE_RATE = 16000
-EMBEDDING_DIM = 192
+from config import cfg
+
+MODEL_SOURCE  = cfg.model.source
+SAMPLE_RATE   = cfg.audio.sample_rate
+EMBEDDING_DIM = cfg.model.embedding_dim
 
 
-def load_model(save_dir: str = "models/ecapa") -> SpeakerRecognition:
+def load_model(save_dir: str | Path = cfg.model.save_dir) -> SpeakerRecognition:
     """Load pretrained ECAPA-TDNN model from SpeechBrain hub."""
     model = SpeakerRecognition.from_hparams(
         source=MODEL_SOURCE,

@@ -1,0 +1,35 @@
+# Voice Authentication System – project configuration
+# All paths are relative to the project root (lab/voice/).
+
+[paths]
+data_dir        = "data"
+voxceleb_dir    = "data/voxceleb1"
+custom_dir      = "data/custom"
+enrollment_dir  = "data/enrollment"
+test_dir        = "data/test"
+db_dir          = "db"
+models_dir      = "models"
+results_dir     = "results"
+augmented_dir   = "augmented"
+
+[audio]
+sample_rate = 16000          # target sample rate for all audio files
+
+[dataset]
+num_speakers                  = 100
+enrollment_samples_per_speaker = 5   # files reserved for enrollment per speaker
+random_seed                   = 42
+
+[huggingface]
+dataset_id = "asahi417/voxceleb1-test-split"
+split      = "test"
+
+[model]
+source        = "speechbrain/spkrec-ecapa-voxceleb"
+save_dir      = "models/ecapa"
+embedding_dim = 192
+
+[auth]
+# Cosine similarity threshold used for verification / identification.
+# Tune this on a validation set (see src/threshold.py).
+threshold = 0.25
