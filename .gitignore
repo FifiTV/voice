@@ -1,0 +1,7 @@
+__venv__
+
+*.onnx
+embeddings/chromadb/*
+
+*.wav
+*.flac

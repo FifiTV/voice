@@ -1,0 +1,25 @@
+# ── Core ML ───────────────────────────────────────────────────────────────────
+torch>=2.0.0
+torchaudio>=2.0.0
+speechbrain>=1.0.0
+
+# ── Audio I/O ─────────────────────────────────────────────────────────────────
+soundfile>=0.12.0          # required audio backend for datasets (DATASETS_AUDIO_BACKEND=soundfile)
+
+# ── Numerics / signal processing ──────────────────────────────────────────────
+numpy>=1.24.0
+scipy>=1.10.0              # EER, ROC, signal processing in tests
+
+# ── HuggingFace dataset streaming ─────────────────────────────────────────────
+datasets>=2.18.0
+huggingface_hub>=0.22.0
+
+# ── Vector database ───────────────────────────────────────────────────────────
+chromadb>=0.4.0
+
+# ── Config ────────────────────────────────────────────────────────────────────
+tomli>=2.0.0; python_version < "3.11"   # tomllib is built-in since 3.11
+
+# ── Data collection ───────────────────────────────────────────────────────────
+yt-dlp>=2024.1.0           # YouTube audio download for group member recordings
+# ffmpeg – install separately (not a pip package): https://ffmpeg.org/download.html
