@@ -6,7 +6,8 @@ import torch
 import torchaudio
 import numpy as np
 from pathlib import Path
-from speechbrain.pretrained import SpeakerRecognition
+# from speechbrain.pretrained import SpeakerRecognition
+from speechbrain.inference.speaker import SpeakerRecognition
 
 from config import cfg
 
