@@ -20,10 +20,13 @@ from pathlib import Path
 import torch
 import torchaudio
 
+import imageio_ffmpeg
+
 from config import cfg
 
 import os
 os.environ["DATASETS_AUDIO_BACKEND"] = "soundfile"
+os.environ["PATH"] += os.pathsep + imageio_ffmpeg.get_ffmpeg_exe().rsplit("\\", 1)[0]
 
 # Shortcuts from config
 _p = cfg.paths
@@ -40,63 +43,73 @@ RANDOM_SEED                    = cfg.dataset.random_seed
 HF_DATASET_ID                  = cfg.huggingface.dataset_id
 HF_DATASET_SPLIT               = cfg.huggingface.split
 
+# LibriSpeech config (no registration required)
+LIBRISPEECH_DATASET_ID    = "openslr/librispeech_asr"
+LIBRISPEECH_DATASET_CONFIG = "clean"
+LIBRISPEECH_DATASET_SPLIT  = "train.100"
+LIBRISPEECH_SPEAKER_PREFIX = "ls_"   # avoids ID collision with VoxCeleb's id10xxx format
+
+VALID_SOURCES = ("voxceleb", "librispeech", "both")
+
 
 # ---------------------------------------------------------------------------
-# HuggingFace streaming download
+# HuggingFace streaming – shared core
 # ---------------------------------------------------------------------------
 
-def download_from_hf(
-    n_speakers: int = NUM_SPEAKERS,
-    min_utterances: int = ENROLLMENT_SAMPLES_PER_SPEAKER + 10,
-    dataset_id: str = HF_DATASET_ID,
-    hf_split: str = HF_DATASET_SPLIT,
-) -> None:
+def _stream_speakers(
+    dataset_id: str,
+    hf_split: str,
+    n_speakers: int,
+    min_utterances: int,
+    speaker_id_prefix: str = "",
+    already_collected: set[str] | None = None,
+    dataset_config: str | None = None,
+) -> set[str]:
     """
-    Stream VoxCeleb1 from HuggingFace and save only the selected speakers.
+    Stream a HuggingFace audio dataset and save utterances for n_speakers.
 
-    Uses datasets streaming mode – audio is downloaded on-the-fly, so only
-    the utterances we actually keep are written to disk (~few GB instead of 39 GB).
+    Speakers whose IDs are in already_collected are skipped (deduplication
+    across sources when source='both').
 
-    Args:
-        n_speakers:       how many speakers to collect
-        min_utterances:   skip speakers with fewer utterances than this
-        dataset_id:       HuggingFace dataset repo id
-        hf_split:         dataset split to stream from
+    Returns the set of newly saved speaker IDs.
     """
-    try:
-        from datasets import load_dataset
-    except ImportError:
-        print("ERROR: 'datasets' package not found. Run: pip install datasets")
-        sys.exit(1)
+    from datasets import load_dataset
 
-    VOXCELEB_DIR.mkdir(parents=True, exist_ok=True)
+    collected: set[str] = set()
+    skip: set[str] = already_collected or set()
 
-    print(f"Streaming {dataset_id} (split={hf_split}) ...")
-    print("Audio is downloaded on-demand – only kept utterances are saved.\n")
+    load_kwargs: dict = dict(split=hf_split, streaming=True)
+    if dataset_config:
+        load_kwargs["name"] = dataset_config
 
-    # ds = load_dataset(dataset_id, split=hf_split, streaming=True, trust_remote_code=True)
-    ds = load_dataset(dataset_id, split=hf_split, streaming=True)
+    label = f"{dataset_id}" + (f" [{dataset_config}]" if dataset_config else "")
+    print(f"\nStreaming {label} (split={hf_split}) – target: {n_speakers} speakers")
+    print("Audio is downloaded on-demand; only kept utterances are written to disk.\n")
 
-    # Buffer: speaker_id -> list of (array, sampling_rate)
+    ds = load_dataset(dataset_id, **load_kwargs)
+
     buffer: dict[str, list[tuple]] = defaultdict(list)
-    collected_speakers: set[str] = set()
 
     for sample in ds:
-        speaker_id: str = sample.get("speaker_id") or sample.get("id") or sample.get("label")
-        if speaker_id is None:
-            # Try to infer speaker id from the audio path metadata
-            audio_info = sample.get("audio", {})
-            path_str = audio_info.get("path", "")
+        # Resolve speaker ID from various field names used across datasets
+        raw_id = (
+            sample.get("speaker_id")
+            or sample.get("speaker")
+            or sample.get("id")
+            or sample.get("label")
+        )
+        if raw_id is None:
+            path_str = (sample.get("audio") or {}).get("path", "")
             parts = Path(path_str).parts
-            # VoxCeleb layout: .../<id10xxx>/<video>/<utt>.wav
-            speaker_id = parts[-3] if len(parts) >= 3 else path_str
+            # VoxCeleb path layout: .../<id10xxx>/<video>/<utt>.wav
+            raw_id = parts[-3] if len(parts) >= 3 else path_str
 
-        speaker_id = str(speaker_id)
+        speaker_id = speaker_id_prefix + str(raw_id)
 
-        if speaker_id in collected_speakers:
+        if speaker_id in collected or speaker_id in skip:
             continue
 
-        audio_info = sample.get("audio", {})
+        audio_info = sample.get("audio") or {}
         array = audio_info.get("array")
         sr = audio_info.get("sampling_rate", SAMPLE_RATE)
 
@@ -107,22 +120,87 @@ def download_from_hf(
 
         if len(buffer[speaker_id]) >= min_utterances:
             _save_speaker_from_buffer(speaker_id, buffer.pop(speaker_id))
-            collected_speakers.add(speaker_id)
-            print(f"  [{len(collected_speakers):3d}/{n_speakers}] saved speaker {speaker_id}")
+            collected.add(speaker_id)
+            total = len(collected) + len(skip)
+            print(f"  [{total:3d}] saved {speaker_id}")
 
-        if len(collected_speakers) >= n_speakers:
+        if len(collected) >= n_speakers:
             break
 
-    if len(collected_speakers) < n_speakers:
-        for speaker_id, utts in buffer.items():
+    # Flush partial buffers if we ran out of data
+    if len(collected) < n_speakers:
+        for speaker_id, utts in list(buffer.items()):
             if len(utts) >= ENROLLMENT_SAMPLES_PER_SPEAKER + 1:
                 _save_speaker_from_buffer(speaker_id, utts)
-                collected_speakers.add(speaker_id)
-                print(f"  [{len(collected_speakers):3d}/{n_speakers}] saved speaker {speaker_id} (partial)")
-            if len(collected_speakers) >= n_speakers:
+                collected.add(speaker_id)
+                print(f"  [{len(collected) + len(skip):3d}] saved {speaker_id} (partial)")
+            if len(collected) >= n_speakers:
                 break
 
-    print(f"\nDone. {len(collected_speakers)} speakers saved to {VOXCELEB_DIR}")
+    print(f"Source done: {len(collected)} speakers from {label}")
+    return collected
+
+
+# ---------------------------------------------------------------------------
+# Public download functions
+# ---------------------------------------------------------------------------
+
+def download_from_hf(
+    n_speakers: int = NUM_SPEAKERS,
+    min_utterances: int = ENROLLMENT_SAMPLES_PER_SPEAKER + 10,
+    source: str = "both",
+    n_voxceleb: int | None = None,
+    n_librispeech: int | None = None,
+) -> None:
+    """
+    Download speakers from HuggingFace using streaming (no full archive needed).
+
+    Args:
+        n_speakers:    total number of speakers to collect
+        min_utterances: minimum utterances required per speaker
+        source:        'voxceleb' | 'librispeech' | 'both'  (default: 'both')
+        n_voxceleb:    speakers from VoxCeleb when source='both'
+                       (default: n_speakers // 2)
+        n_librispeech: speakers from LibriSpeech when source='both'
+                       (default: n_speakers - n_voxceleb)
+    """
+    if source not in VALID_SOURCES:
+        print(f"ERROR: --source must be one of {VALID_SOURCES}")
+        sys.exit(1)
+
+    VOXCELEB_DIR.mkdir(parents=True, exist_ok=True)
+    all_collected: set[str] = set()
+
+    if source in ("voxceleb", "both"):
+        n_vc = n_voxceleb if n_voxceleb is not None else (
+            n_speakers // 2 if source == "both" else n_speakers
+        )
+        collected = _stream_speakers(
+            dataset_id=HF_DATASET_ID,
+            hf_split=HF_DATASET_SPLIT,
+            n_speakers=n_vc,
+            min_utterances=min_utterances,
+            speaker_id_prefix="",
+            already_collected=all_collected,
+        )
+        all_collected |= collected
+
+    if source in ("librispeech", "both"):
+        n_ls = n_librispeech if n_librispeech is not None else (
+            n_speakers - len(all_collected) if source == "both" else n_speakers
+        )
+        collected = _stream_speakers(
+            dataset_id=LIBRISPEECH_DATASET_ID,
+            hf_split=LIBRISPEECH_DATASET_SPLIT,
+            n_speakers=n_ls,
+            min_utterances=min_utterances,
+            speaker_id_prefix=LIBRISPEECH_SPEAKER_PREFIX,
+            already_collected=all_collected,
+            dataset_config=LIBRISPEECH_DATASET_CONFIG,
+        )
+        all_collected |= collected
+
+    print(f"\nTotal speakers saved: {len(all_collected)}")
     split_enrollment_test()
     save_speaker_list()
 
@@ -261,11 +339,19 @@ def save_speaker_list(
 # Custom recordings via yt-dlp (group members)
 # ---------------------------------------------------------------------------
 
-def _check_tool(name: str) -> None:
-    if shutil.which(name) is None:
+import imageio_ffmpeg
+
+FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+
+def _check_tool(name: str) -> str:
+    """Return executable path; uses bundled ffmpeg if name=='ffmpeg'."""
+    if name == "ffmpeg":
+        return FFMPEG_PATH
+    path = shutil.which(name)
+    if path is None:
         print(f"ERROR: '{name}' not found in PATH. Install it first.")
         sys.exit(1)
-
+    return path
 
 def download_custom(
     youtube_urls: list[str],
@@ -286,11 +372,15 @@ def download_custom(
 
     for url in youtube_urls:
         print(f"\nDownloading: {url}")
+        ffmpeg_exe = _check_tool("ffmpeg")
+        ffmpeg_dir = str(Path(ffmpeg_exe).parent)  # katalog, nie plik
+
         cmd = [
             "yt-dlp",
             "--extract-audio",
             "--audio-format", "wav",
             "--audio-quality", "0",
+            "--ffmpeg-location", FFMPEG_PATH,  # pełna ścieżka do pliku, nie katalogu
             "--match-filter", f"duration < {max_duration_s}",
             "--output", str(tmp_dir / "%(id)s.%(ext)s"),
             url,
@@ -304,7 +394,7 @@ def download_custom(
         _resample_to_16k(wav_file, out_path)
         wav_file.unlink()
 
-    tmp_dir.rmdir()
+    shutil.rmtree(tmp_dir, ignore_errors=True)
     print(f"\nCustom recordings saved to {out_dir}")
 
 
@@ -329,12 +419,19 @@ def parse_args() -> argparse.Namespace:
 
     p_hf = sub.add_parser(
         "download-hf",
-        help="Stream VoxCeleb1 from HuggingFace (recommended – no full download)",
+        help="Stream speakers from HuggingFace datasets (no full archive download)",
     )
-    p_hf.add_argument("--n-speakers", type=int, default=NUM_SPEAKERS)
-    p_hf.add_argument("--min-utterances", type=int, default=ENROLLMENT_SAMPLES_PER_SPEAKER + 10)
-    p_hf.add_argument("--dataset-id", type=str, default=HF_DATASET_ID)
-    p_hf.add_argument("--split", type=str, default=HF_DATASET_SPLIT)
+    p_hf.add_argument("--n-speakers", type=int, default=NUM_SPEAKERS,
+                      help=f"Total speakers to collect (default: {NUM_SPEAKERS})")
+    p_hf.add_argument("--min-utterances", type=int, default=ENROLLMENT_SAMPLES_PER_SPEAKER + 10,
+                      help="Min utterances required per speaker (default: 15)")
+    p_hf.add_argument("--source", type=str, default="both",
+                      choices=list(VALID_SOURCES),
+                      help="Dataset source: voxceleb | librispeech | both (default: both)")
+    p_hf.add_argument("--n-voxceleb", type=int, default=None,
+                      help="Speakers from VoxCeleb when --source=both (default: n_speakers//2)")
+    p_hf.add_argument("--n-librispeech", type=int, default=None,
+                      help="Speakers from LibriSpeech when --source=both (default: remainder)")
 
     p_org = sub.add_parser("organize", help="Organize locally extracted VoxCeleb1")
     p_org.add_argument("raw_vox_root", type=Path)
@@ -357,8 +454,9 @@ if __name__ == "__main__":
         download_from_hf(
             n_speakers=args.n_speakers,
             min_utterances=args.min_utterances,
-            dataset_id=args.dataset_id,
-            hf_split=args.split,
+            source=args.source,
+            n_voxceleb=args.n_voxceleb,
+            n_librispeech=args.n_librispeech,
         )
     elif args.command == "organize":
         organize_voxceleb(args.raw_vox_root, args.n_speakers)
