@@ -5,3 +5,8 @@ embeddings/chromadb/*
 
 *.wav
 *.flac
+
+*.png
+*.jpg
+*.json
+*.csv
