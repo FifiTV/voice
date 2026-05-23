@@ -27,14 +27,42 @@ def load_model(save_dir: str | Path = cfg.model.save_dir) -> SpeakerRecognition:
 
 
 def load_audio(audio_path: str | Path, target_sr: int = SAMPLE_RATE) -> torch.Tensor:
-    """Load and resample audio file to mono 16kHz. Returns (1, T) tensor."""
-    waveform, sr = torchaudio.load(str(audio_path))
+    """
+    Load any audio format to mono 16kHz tensor.
 
-    # Convert to mono
+    Tries torchaudio first (WAV/FLAC/OGG native). Falls back to ffmpeg decoding
+    for formats soundfile cannot read (MP3, M4A, Opus, AAC, etc.).
+    """
+    import tempfile, subprocess
+    audio_path = Path(audio_path).resolve()
+
+    if not audio_path.exists():
+        raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+    try:
+        waveform, sr = torchaudio.load(str(audio_path))
+    except Exception:
+        import imageio_ffmpeg
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            result = subprocess.run(
+                [ffmpeg, "-y", "-i", str(audio_path), "-c:a", "pcm_s16le", str(tmp_path)],
+                capture_output=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"ffmpeg failed to decode {audio_path.name}:\n"
+                    + result.stderr.decode(errors="replace")
+                )
+            waveform, sr = torchaudio.load(str(tmp_path))
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
     if waveform.shape[0] > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
 
-    # Resample if needed
     if sr != target_sr:
         resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=target_sr)
         waveform = resampler(waveform)

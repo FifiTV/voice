@@ -92,27 +92,33 @@ def identify_speaker(
     collection: Collection,
     query_embedding: np.ndarray,
     threshold: float = cfg.auth.threshold,
-) -> tuple[str | None, float]:
+    top_n: int = 1,
+) -> tuple[str | None, float] | list[tuple[str, float]]:
     """
-    Identify the closest matching speaker for a query embedding.
+    Identify the closest matching speaker(s) for a query embedding.
 
-    Returns:
-        (user_id, cosine_similarity) if similarity >= threshold, else (None, similarity).
+    top_n=1 (default): returns (user_id | None, similarity)
+    top_n>1:           returns list of (user_id, similarity) sorted by score desc
     """
+    n = min(top_n, collection.count()) if collection.count() > 0 else 1
     result = collection.query(
         query_embeddings=[query_embedding.tolist()],
-        n_results=1,
+        n_results=n,
         include=["distances", "metadatas"],
     )
 
     if not result["ids"][0]:
-        return None, 0.0
+        return (None, 0.0) if top_n == 1 else []
 
-    # ChromaDB cosine distance = 1 - cosine_similarity
-    distance = result["distances"][0][0]
-    similarity = 1.0 - distance
-    user_id = result["ids"][0][0]
+    hits = [
+        (result["ids"][0][i], 1.0 - result["distances"][0][i])
+        for i in range(len(result["ids"][0]))
+    ]
 
+    if top_n > 1:
+        return hits
+
+    user_id, similarity = hits[0]
     if similarity >= threshold:
         return user_id, similarity
     return None, similarity
