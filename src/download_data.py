@@ -44,12 +44,20 @@ HF_DATASET_ID                  = cfg.huggingface.dataset_id
 HF_DATASET_SPLIT               = cfg.huggingface.split
 
 # LibriSpeech config (no registration required)
-LIBRISPEECH_DATASET_ID    = "openslr/librispeech_asr"
+LIBRISPEECH_DATASET_ID     = "openslr/librispeech_asr"
 LIBRISPEECH_DATASET_CONFIG = "clean"
 LIBRISPEECH_DATASET_SPLIT  = "train.100"
 LIBRISPEECH_SPEAKER_PREFIX = "ls_"   # avoids ID collision with VoxCeleb's id10xxx format
 
-VALID_SOURCES = ("voxceleb", "librispeech", "both")
+# VoxPopuli — multilingual parliamentary speech, 16 kHz, speaker_id field
+VOXPOPULI_DATASET_ID     = "facebook/voxpopuli"
+VOXPOPULI_DATASET_CONFIG = "en"
+VOXPOPULI_DATASET_SPLIT  = "train"
+VOXPOPULI_SPEAKER_PREFIX = "vp_"   # avoids ID collision with numeric LibriSpeech IDs
+
+VALID_SOURCES = ("voxceleb", "librispeech", "voxpopuli", "both", "all")
+
+AUDIO_EXTENSIONS = {".wav", ".flac", ".mp3", ".ogg", ".m4a", ".opus"}
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +159,7 @@ def download_from_hf(
     source: str = "both",
     n_voxceleb: int | None = None,
     n_librispeech: int | None = None,
+    n_voxpopuli: int | None = None,
 ) -> None:
     """
     Download speakers from HuggingFace using streaming (no full archive needed).
@@ -158,11 +167,12 @@ def download_from_hf(
     Args:
         n_speakers:    total number of speakers to collect
         min_utterances: minimum utterances required per speaker
-        source:        'voxceleb' | 'librispeech' | 'both'  (default: 'both')
-        n_voxceleb:    speakers from VoxCeleb when source='both'
-                       (default: n_speakers // 2)
-        n_librispeech: speakers from LibriSpeech when source='both'
-                       (default: n_speakers - n_voxceleb)
+        source:        'voxceleb' | 'librispeech' | 'voxpopuli' | 'both' | 'all'
+                       'both' = voxceleb + librispeech (default)
+                       'all'  = voxceleb + librispeech + voxpopuli
+        n_voxceleb:    speakers from VoxCeleb (default: n_speakers // 2 for 'both')
+        n_librispeech: speakers from LibriSpeech (default: remainder after VoxCeleb)
+        n_voxpopuli:   speakers from VoxPopuli (default: remainder, only for 'all')
     """
     if source not in VALID_SOURCES:
         print(f"ERROR: --source must be one of {VALID_SOURCES}")
@@ -171,9 +181,11 @@ def download_from_hf(
     VOXCELEB_DIR.mkdir(parents=True, exist_ok=True)
     all_collected: set[str] = set()
 
-    if source in ("voxceleb", "both"):
+    if source in ("voxceleb", "both", "all"):
         n_vc = n_voxceleb if n_voxceleb is not None else (
-            n_speakers // 2 if source == "both" else n_speakers
+            n_speakers // 3 if source == "all" else
+            n_speakers // 2 if source == "both" else
+            n_speakers
         )
         collected = _stream_speakers(
             dataset_id=HF_DATASET_ID,
@@ -185,9 +197,11 @@ def download_from_hf(
         )
         all_collected |= collected
 
-    if source in ("librispeech", "both"):
+    if source in ("librispeech", "both", "all"):
         n_ls = n_librispeech if n_librispeech is not None else (
-            n_speakers - len(all_collected) if source == "both" else n_speakers
+            n_speakers - len(all_collected) if source == "both" else
+            n_speakers // 3 if source == "all" else
+            n_speakers
         )
         collected = _stream_speakers(
             dataset_id=LIBRISPEECH_DATASET_ID,
@@ -197,6 +211,21 @@ def download_from_hf(
             speaker_id_prefix=LIBRISPEECH_SPEAKER_PREFIX,
             already_collected=all_collected,
             dataset_config=LIBRISPEECH_DATASET_CONFIG,
+        )
+        all_collected |= collected
+
+    if source in ("voxpopuli", "all"):
+        n_vp = n_voxpopuli if n_voxpopuli is not None else (
+            n_speakers - len(all_collected) if source == "all" else n_speakers
+        )
+        collected = _stream_speakers(
+            dataset_id=VOXPOPULI_DATASET_ID,
+            hf_split=VOXPOPULI_DATASET_SPLIT,
+            n_speakers=n_vp,
+            min_utterances=min_utterances,
+            speaker_id_prefix=VOXPOPULI_SPEAKER_PREFIX,
+            already_collected=all_collected,
+            dataset_config=VOXPOPULI_DATASET_CONFIG,
         )
         all_collected |= collected
 
@@ -283,7 +312,7 @@ def split_enrollment_test(speaker_root: Path = VOXCELEB_DIR) -> None:
         if not spk_dir.is_dir():
             continue
 
-        wavs = sorted(spk_dir.rglob("*.wav"))
+        wavs = sorted(f for f in spk_dir.rglob("*") if f.suffix.lower() in AUDIO_EXTENSIONS)
         rng.shuffle(wavs)
 
         if len(wavs) < ENROLLMENT_SAMPLES_PER_SPEAKER + 1:
@@ -323,8 +352,8 @@ def save_speaker_list(
             continue
         enroll_dir = ENROLLMENT_DIR / spk_dir.name
         test_dir = TEST_DIR / spk_dir.name
-        n_enroll = len(list(enroll_dir.rglob("*.wav"))) if enroll_dir.exists() else 0
-        n_test = len(list(test_dir.rglob("*.wav"))) if test_dir.exists() else 0
+        n_enroll = len([f for f in enroll_dir.rglob("*") if f.suffix.lower() in AUDIO_EXTENSIONS]) if enroll_dir.exists() else 0
+        n_test   = len([f for f in test_dir.rglob("*")   if f.suffix.lower() in AUDIO_EXTENSIONS]) if test_dir.exists() else 0
         rows.append({"speaker_id": spk_dir.name, "n_enrollment": n_enroll, "n_test": n_test})
 
     with open(out_csv, "w", newline="") as f:
@@ -410,6 +439,47 @@ def _resample_to_16k(src: Path, dst: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Audio conversion
+# ---------------------------------------------------------------------------
+
+def convert_to_wav(
+    src_dir: Path,
+    out_dir: Path | None = None,
+    remove_originals: bool = False,
+) -> None:
+    """
+    Convert all non-WAV audio files in src_dir to 16 kHz mono WAV.
+
+    If out_dir is None, converted files are placed next to the originals.
+    If remove_originals is True, source files are deleted after conversion.
+    """
+    out_dir = out_dir or src_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    to_convert = [
+        f for f in sorted(src_dir.rglob("*"))
+        if f.suffix.lower() in AUDIO_EXTENSIONS and f.suffix.lower() != ".wav"
+    ]
+
+    if not to_convert:
+        print(f"No non-WAV audio files found in {src_dir}")
+        return
+
+    print(f"Converting {len(to_convert)} file(s) to 16 kHz mono WAV...\n")
+    for src in to_convert:
+        dst = out_dir / (src.stem + ".wav")
+        try:
+            _resample_to_16k(src, dst)
+            if remove_originals and src.resolve() != dst.resolve():
+                src.unlink()
+                print(f"    [removed] {src.name}")
+        except Exception as e:
+            print(f"  [error] {src.name}: {e}")
+
+    print(f"\nDone. WAV files saved to {out_dir}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -427,17 +497,31 @@ def parse_args() -> argparse.Namespace:
                       help="Min utterances required per speaker (default: 15)")
     p_hf.add_argument("--source", type=str, default="both",
                       choices=list(VALID_SOURCES),
-                      help="Dataset source: voxceleb | librispeech | both (default: both)")
+                      help="Dataset source: voxceleb | librispeech | voxpopuli | both | all (default: both)")
     p_hf.add_argument("--n-voxceleb", type=int, default=None,
-                      help="Speakers from VoxCeleb when --source=both (default: n_speakers//2)")
+                      help="Speakers from VoxCeleb (default: n_speakers//2 for 'both', //3 for 'all')")
     p_hf.add_argument("--n-librispeech", type=int, default=None,
-                      help="Speakers from LibriSpeech when --source=both (default: remainder)")
+                      help="Speakers from LibriSpeech (default: remainder after VoxCeleb)")
+    p_hf.add_argument("--n-voxpopuli", type=int, default=None,
+                      help="Speakers from VoxPopuli when --source=voxpopuli or all (default: remainder)")
 
     p_org = sub.add_parser("organize", help="Organize locally extracted VoxCeleb1")
     p_org.add_argument("raw_vox_root", type=Path)
     p_org.add_argument("--n-speakers", type=int, default=NUM_SPEAKERS)
 
-    sub.add_parser("split", help="Split data/voxceleb1/ into enrollment and test")
+    p_split = sub.add_parser("split", help="Split speaker audio into enrollment and test sets")
+    p_split.add_argument(
+        "--speaker-root", type=Path, default=None,
+        help="Root folder with <speaker_id>/ subfolders (default: data/voxceleb1/)",
+    )
+
+    p_conv = sub.add_parser("convert", help="Convert MP3/M4A/OGG files to 16 kHz mono WAV")
+    p_conv.add_argument("src_dir", type=Path,
+                        help="Folder with audio files to convert (e.g. data/custom/maklowicz)")
+    p_conv.add_argument("--out-dir", type=Path, default=None,
+                        help="Output folder (default: same as src_dir)")
+    p_conv.add_argument("--remove-originals", action="store_true",
+                        help="Delete source files after successful conversion")
 
     p_dl = sub.add_parser("download-custom", help="Download YouTube audio for a group member")
     p_dl.add_argument("speaker_id")
@@ -457,13 +541,21 @@ if __name__ == "__main__":
             source=args.source,
             n_voxceleb=args.n_voxceleb,
             n_librispeech=args.n_librispeech,
+            n_voxpopuli=args.n_voxpopuli,
         )
     elif args.command == "organize":
         organize_voxceleb(args.raw_vox_root, args.n_speakers)
         split_enrollment_test()
         save_speaker_list()
+    elif args.command == "convert":
+        convert_to_wav(
+            src_dir=args.src_dir,
+            out_dir=args.out_dir,
+            remove_originals=args.remove_originals,
+        )
     elif args.command == "split":
-        split_enrollment_test()
-        save_speaker_list()
+        root = args.speaker_root if args.speaker_root else VOXCELEB_DIR
+        split_enrollment_test(speaker_root=root)
+        save_speaker_list(speaker_root=root)
     elif args.command == "download-custom":
         download_custom(args.urls, args.speaker_id, args.max_duration)
