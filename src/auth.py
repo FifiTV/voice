@@ -110,6 +110,79 @@ class AuthSystem:
         )
         return IdentifyResult(user_id=user_id, score=score, threshold=self.threshold)
 
+    def top_matches(
+        self, audio_path: str | Path, n: int = 5
+    ) -> list[tuple[str, float]]:
+        """Return top-n (user_id, similarity) pairs sorted by score descending."""
+        embedding = get_embedding(self._model, audio_path)
+        return identify_speaker(self._collection, embedding, self.threshold, top_n=n)
+
+    def demo(self, audio_path: str | Path, claimed_id: str | None = None) -> None:
+        """Pretty-print verification/identification results for live demo."""
+        import os
+        audio_path = Path(audio_path)
+        duration = _audio_duration(audio_path)
+
+        print()
+        print("=" * 56)
+        print("  VOICE AUTHENTICATION DEMO")
+        print("=" * 56)
+        print(f"  File      : {audio_path.name}")
+        print(f"  Duration  : {duration:.2f} s")
+        print(f"  Threshold : {self.threshold:.4f}")
+        print("-" * 56)
+
+        # 1-to-1 verification
+        if claimed_id:
+            print(f"\n  [VERIFY]  claimed identity: {claimed_id}")
+            try:
+                result = self.verify(claimed_id, audio_path)
+                _print_score_bar(result.score, self.threshold)
+                verdict = "ACCEPTED" if result.accepted else "REJECTED"
+                print(f"  Result    : {verdict}")
+            except KeyError:
+                print(f"  ERROR: '{claimed_id}' is not enrolled.")
+
+        # 1-to-N identification — top 5
+        print("\n  [IDENTIFY]  top-5 candidates")
+        hits = self.top_matches(audio_path, n=5)
+        if not hits:
+            print("  No speakers in database.")
+        else:
+            for rank, (uid, score) in enumerate(hits, 1):
+                tag = "<-- match" if score >= self.threshold else ""
+                bar = _score_bar(score)
+                print(f"  {rank}. {uid:<20s}  {bar}  {score:.4f}  {tag}")
+
+        print("=" * 56)
+        print()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _score_bar(score: float, width: int = 20) -> str:
+    filled = max(0, min(width, round(score * width)))
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+def _print_score_bar(score: float, threshold: float, width: int = 20) -> None:
+    bar = _score_bar(score, width)
+    thr_pos = max(0, min(width, round(threshold * width)))
+    marker = " " * (thr_pos + 1) + "^threshold"
+    print(f"  Score     : {score:.4f}  {bar}")
+    print(f"             {marker}")
+
+
+def _audio_duration(audio_path: Path) -> float:
+    try:
+        import torchaudio
+        info = torchaudio.info(str(audio_path))
+        return info.num_frames / info.sample_rate
+    except Exception:
+        return 0.0
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -129,6 +202,11 @@ def _parse_args() -> argparse.Namespace:
 
     p_identify = sub.add_parser("identify", help="1-to-N identification")
     p_identify.add_argument("audio_path", type=Path, help="Audio file to identify")
+
+    p_demo = sub.add_parser("demo", help="Live demo: pretty-print top matches + optional verify")
+    p_demo.add_argument("audio_path", type=Path, help="Audio file (WAV, MP3, M4A, OGG, …)")
+    p_demo.add_argument("--user-id", type=str, default=None,
+                        help="Claimed speaker ID for 1-to-1 verification (optional)")
 
     return parser.parse_args()
 
@@ -150,3 +228,6 @@ if __name__ == "__main__":
         result = auth.identify(args.audio_path)
         print(result)
         sys.exit(0 if result.user_id is not None else 1)
+
+    elif args.command == "demo":
+        auth.demo(args.audio_path, claimed_id=args.user_id)
