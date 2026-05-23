@@ -22,20 +22,24 @@ import sys
 from pathlib import Path
 
 from config import cfg
-from database import get_collection, enroll_user, list_enrolled
+from database import get_collection, enroll_user, list_enrolled, remove_user
 from embeddings import load_model, get_mean_embedding
 
 ENROLLMENT_DIR = cfg.paths.enrollment_dir
 SUPPORTED_EXT  = {".wav", ".flac", ".mp3", ".ogg", ".m4a"}
 
 
-def enroll_all(overwrite: bool = False) -> None:
+def enroll_all(overwrite: bool = False, exclude_prefix: str | None = None) -> None:
     """Enroll every speaker found in data/enrollment/<speaker_id>/."""
     if not ENROLLMENT_DIR.exists():
         print(f"ERROR: Enrollment directory not found: {ENROLLMENT_DIR}")
         sys.exit(1)
 
     speaker_dirs = sorted([d for d in ENROLLMENT_DIR.iterdir() if d.is_dir()])
+    if exclude_prefix:
+        before = len(speaker_dirs)
+        speaker_dirs = [d for d in speaker_dirs if not d.name.startswith(exclude_prefix)]
+        print(f"Excluding {before - len(speaker_dirs)} speaker(s) with prefix '{exclude_prefix}'.")
     if not speaker_dirs:
         print(f"No speaker folders found in {ENROLLMENT_DIR}")
         sys.exit(1)
@@ -117,6 +121,47 @@ def enroll_single(speaker_id: str, audio_dir: Path, overwrite: bool = False) -> 
     print(f"Total speakers in DB: {collection.count()}")
 
 
+def delete_speaker(speaker_id: str) -> None:
+    collection = get_collection()
+    enrolled = set(list_enrolled(collection))
+    if speaker_id not in enrolled:
+        print(f"Speaker '{speaker_id}' not found in database.")
+        sys.exit(1)
+    remove_user(collection, speaker_id)
+
+
+def delete_prefix(prefix: str, yes: bool = False) -> None:
+    collection = get_collection()
+    matches = [sid for sid in list_enrolled(collection) if sid.startswith(prefix)]
+    if not matches:
+        print(f"No enrolled speakers with prefix '{prefix}'.")
+        return
+    if not yes:
+        ans = input(f"Delete {len(matches)} speaker(s) with prefix '{prefix}'? [y/N] ")
+        if ans.strip().lower() != "y":
+            print("Aborted.")
+            sys.exit(0)
+    for sid in matches:
+        collection.delete(ids=[sid])
+    print(f"Removed {len(matches)} speaker(s) with prefix '{prefix}'.")
+
+
+def delete_all(yes: bool = False) -> None:
+    collection = get_collection()
+    enrolled = list_enrolled(collection)
+    if not enrolled:
+        print("Database is already empty.")
+        return
+    if not yes:
+        ans = input(f"Delete ALL {len(enrolled)} speakers from the database? [y/N] ")
+        if ans.strip().lower() != "y":
+            print("Aborted.")
+            sys.exit(0)
+    for sid in enrolled:
+        collection.delete(ids=[sid])
+    print(f"Removed {len(enrolled)} speaker(s). Database is now empty.")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Enroll speakers into ChromaDB")
     parser.add_argument(
@@ -135,6 +180,26 @@ def parse_args() -> argparse.Namespace:
         "--list", action="store_true",
         help="List enrolled speakers and exit",
     )
+    parser.add_argument(
+        "--exclude", type=str, metavar="PREFIX",
+        help="Skip speakers whose ID starts with PREFIX when enrolling (e.g. ls_)",
+    )
+    parser.add_argument(
+        "--delete", type=str, metavar="SPEAKER_ID",
+        help="Remove a single speaker from the database",
+    )
+    parser.add_argument(
+        "--delete-prefix", type=str, metavar="PREFIX",
+        help="Remove all speakers whose ID starts with PREFIX (e.g. ls_)",
+    )
+    parser.add_argument(
+        "--delete-all", action="store_true",
+        help="Remove all speakers from the database",
+    )
+    parser.add_argument(
+        "--yes", action="store_true",
+        help="Skip confirmation prompt for --delete-prefix and --delete-all",
+    )
     return parser.parse_args()
 
 
@@ -149,10 +214,22 @@ if __name__ == "__main__":
             print(f"  {sid}")
         sys.exit(0)
 
+    if args.delete:
+        delete_speaker(args.delete)
+        sys.exit(0)
+
+    if args.delete_prefix:
+        delete_prefix(args.delete_prefix, yes=args.yes)
+        sys.exit(0)
+
+    if args.delete_all:
+        delete_all(yes=args.yes)
+        sys.exit(0)
+
     if args.speaker_id:
         if not args.audio_dir:
             print("ERROR: --audio-dir is required when using --speaker-id")
             sys.exit(1)
         enroll_single(args.speaker_id, args.audio_dir, overwrite=args.overwrite)
     else:
-        enroll_all(overwrite=args.overwrite)
+        enroll_all(overwrite=args.overwrite, exclude_prefix=args.exclude)
